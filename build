@@ -1,0 +1,17 @@
+
+make -j$(nproc) ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- uImage modules
+if [ $? -eq 0 ]
+then
+    echo "=============== SUCESS ================"
+else
+    echo "=============== ERRROR ================"
+    exit
+fi
+
+
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- INSTALL_MOD_PATH=output modules_install
+
+scp arch/arm/boot/uImage root@192.168.1.163:/boot
+
+rsync -avz -e ssh output/lib/modules/* root@192.168.1.163:/lib/modules/
+

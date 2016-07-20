@@ -23,10 +23,17 @@ struct uart_8250_port {
 	unsigned char		acr;
 	unsigned char		ier;
 	unsigned char		lcr;
+	unsigned char		fcr;
 	unsigned char		mcr;
 	unsigned char		mcr_mask;	/* mask of user bits */
 	unsigned char		mcr_force;	/* mask of forced bits */
 	unsigned char		cur_iotype;	/* Running I/O type */
+
+	struct serial_rs485	rs485;
+	int					rts_gpio;
+	bool				rts_gpio_valid;
+	unsigned 			rts_gpio_hdlr;
+	unsigned 			cts_gpio_hdlr;
 
 	/*
 	 * Some bits in registers are cleared on a read, so they must

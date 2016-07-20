@@ -38,12 +38,23 @@
 #include <linux/nmi.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/pm.h>
+#include <linux/uaccess.h>
+#include <linux/pm_runtime.h>
+#include <plat/sys_config.h>
+
+
+
 #ifdef CONFIG_SPARC
 #include <linux/sunserialcore.h>
 #endif
 
 #include <asm/io.h>
 #include <asm/irq.h>
+
+#include <linux/gpio.h>
+#include <linux/of_gpio.h>
+
 
 #include "8250.h"
 
@@ -1285,11 +1296,47 @@ static void autoconfig_irq(struct uart_8250_port *up)
 
 static inline void __stop_tx(struct uart_8250_port *p)
 {
+	if (p->rs485.flags & SER_RS485_ENABLED) {
+		int ret;
+
+		ret = (p->rs485.flags & SER_RS485_RTS_AFTER_SEND) ? 1 : 0;
+		if (gpio_get_value(p->rts_gpio) != ret) {
+			if (p->rs485.delay_rts_after_send > 0)
+				mdelay(p->rs485.delay_rts_after_send);
+			gpio_set_value(p->rts_gpio, ret);
+		}
+	}
+
 	if (p->ier & UART_IER_THRI) {
 		p->ier &= ~UART_IER_THRI;
 		serial_out(p, UART_IER, p->ier);
 	}
+
+	if ((p->rs485.flags & SER_RS485_ENABLED) &&
+			!(p->rs485.flags & SER_RS485_RX_DURING_TX)) {
+		/*
+		 * Empty the RX FIFO, we are not interested in anything
+		 * received during the half-duplex transmission.
+		 */
+		serial_out(p, UART_FCR, p->fcr | UART_FCR_CLEAR_RCVR);
+		/* Re-enable RX interrupts */
+		p->ier |= UART_IER_RLSI | UART_IER_RDI;
+		p->port.read_status_mask |= UART_LSR_DR;
+		serial_out(p, UART_IER, p->ier);
+	}
+
 }
+
+static void serial8250_stop_rx(struct uart_port *port)
+{
+	struct uart_8250_port *up =
+		container_of(port, struct uart_8250_port, port);
+
+	up->ier &= ~UART_IER_RLSI;
+	up->port.read_status_mask &= ~UART_LSR_DR;
+	serial_port_out(port, UART_IER, up->ier);
+}
+
 
 static void serial8250_stop_tx(struct uart_port *port)
 {
@@ -1313,6 +1360,22 @@ static void serial8250_start_tx(struct uart_port *port)
 		container_of(port, struct uart_8250_port, port);
 
 	if (!(up->ier & UART_IER_THRI)) {
+
+
+
+		if (up->rs485.flags & SER_RS485_ENABLED) {
+			int ret;
+			ret = (up->rs485.flags & SER_RS485_RTS_ON_SEND) ? 1 : 0;
+			if (gpio_get_value(up->rts_gpio) != ret) {
+				gpio_set_value(up->rts_gpio, ret);
+				if (up->rs485.delay_rts_before_send > 0)
+					mdelay(up->rs485.delay_rts_before_send);
+			}
+			if (!(up->rs485.flags & SER_RS485_RX_DURING_TX))
+				serial8250_stop_rx(port);
+		}
+
+
 		up->ier |= UART_IER_THRI;
 		serial_port_out(port, UART_IER, up->ier);
 
@@ -1334,16 +1397,7 @@ static void serial8250_start_tx(struct uart_port *port)
 		up->acr &= ~UART_ACR_TXDIS;
 		serial_icr_write(up, UART_ACR, up->acr);
 	}
-}
 
-static void serial8250_stop_rx(struct uart_port *port)
-{
-	struct uart_8250_port *up =
-		container_of(port, struct uart_8250_port, port);
-
-	up->ier &= ~UART_IER_RLSI;
-	up->port.read_status_mask &= ~UART_LSR_DR;
-	serial_port_out(port, UART_IER, up->ier);
 }
 
 static void serial8250_enable_ms(struct uart_port *port)
@@ -2447,6 +2501,9 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
 			serial_port_out(port, UART_FCR, UART_FCR_ENABLE_FIFO);
 		serial_port_out(port, UART_FCR, fcr);		/* set fcr */
 	}
+
+	up->fcr = fcr;
+
 	serial8250_set_mctrl(port, port->mctrl);
 	spin_unlock_irqrestore(&port->lock, flags);
 	/* Don't rewrite B0 */
@@ -2454,6 +2511,204 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
 		tty_termios_encode_baud_rate(termios, baud, baud);
 }
 EXPORT_SYMBOL(serial8250_do_set_termios);
+
+int serial8250_probe_rs485(struct uart_8250_port *up,
+		struct device *dev)
+{
+	struct serial_rs485 *rs485conf = &up->rs485;
+	struct device_node *np = dev->of_node;
+	u32 rs485_delay[2];
+	enum of_gpio_flags flags;
+	int ret;
+
+	pr_info("probe_rs485\n");
+
+	up->rts_gpio_hdlr = 0;
+	up->cts_gpio_hdlr = 0;
+
+	rs485conf->flags = 0;
+	if (!np)
+		return 0;
+
+	/* check for tx enable gpio */
+	up->rts_gpio = of_get_named_gpio_flags(np, "PI16", 0, &flags);
+	if (up->rts_gpio == -EPROBE_DEFER)
+		return -EPROBE_DEFER;
+	if (!gpio_is_valid(up->rts_gpio))
+		return 0;
+
+	ret = devm_gpio_request(dev, up->rts_gpio, "serial_rts");
+	if (ret < 0)
+		return ret;
+	ret = gpio_direction_output(up->rts_gpio,
+			flags & SER_RS485_RTS_AFTER_SEND);
+	if (ret < 0)
+		return ret;
+
+	up->rts_gpio_valid = true;
+
+	if (of_property_read_bool(np, "rs485-rts-active-high"))
+		rs485conf->flags |= SER_RS485_RTS_ON_SEND;
+	else
+		rs485conf->flags |= SER_RS485_RTS_AFTER_SEND;
+
+	if (of_property_read_u32_array(np, "rs485-rts-delay",
+				rs485_delay, 2) == 0) {
+		rs485conf->delay_rts_before_send = rs485_delay[0];
+		rs485conf->delay_rts_after_send = rs485_delay[1];
+	}
+
+	if (of_property_read_bool(np, "rs485-rx-during-tx"))
+	rs485conf->flags |= SER_RS485_RX_DURING_TX;
+
+	if (of_property_read_bool(np, "linux,rs485-enabled-at-boot-time"))
+		rs485conf->flags |= SER_RS485_ENABLED;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(serial8250_probe_rs485);
+
+
+
+static void serial8250_config_rs485(struct uart_port *port,
+		struct serial_rs485 *rs485conf)
+{
+	struct uart_8250_port *up =
+		container_of(port, struct uart_8250_port, port);
+	unsigned long flags;
+	unsigned int mode;
+	int val;
+
+	pr_info("pm_runtime_get_sync\n");
+	pm_runtime_get_sync(port->dev);
+	pr_info("spin_lock_irqsave\n");
+	spin_lock_irqsave(&up->port.lock, flags);
+
+	/* Disable interrupts from this port */
+	mode = up->ier;
+	up->ier = 0;
+	pr_info("serial_out\n");
+	serial_out(up, UART_IER, 0);
+
+	/* store new config */
+	up->rs485 = *rs485conf;
+
+	/* enable / disable rts */
+	val = (up->rs485.flags & SER_RS485_ENABLED) ?
+		SER_RS485_RTS_AFTER_SEND : SER_RS485_RTS_ON_SEND;
+	val = (up->rs485.flags & val) ? 1 : 0;
+
+	pr_info("gpio_set_value\n");
+	gpio_set_value(up->rts_gpio, val);
+
+	/* Enable interrupts */
+	up->ier = mode;
+	pr_info("serial_out\n");
+	serial_out(up, UART_IER, up->ier);
+
+	pr_info("spin_unlock_irqrestore\n");
+	spin_unlock_irqrestore(&up->port.lock, flags);
+
+	pr_info("pm_runtime_mark_last_busy\n");
+	pm_runtime_mark_last_busy(port->dev);
+
+	pr_info("pm_runtime_put_autosuspend\n");
+	pm_runtime_put_autosuspend(port->dev);
+}
+
+static int serial8250_ioctl(struct uart_port *port, unsigned int cmd,
+		unsigned long arg)
+{
+	struct serial_rs485 rs485conf;
+	struct uart_8250_port *up;
+
+	int res;
+	int mcr;
+
+	up = container_of(port, struct uart_8250_port, port);
+
+	switch (cmd) {
+		case TIOCSRS485:
+			/*
+
+			pr_info("gpio_is_valid 1\n");
+			if (!gpio_is_valid(up->rts_gpio))
+				return -ENODEV;
+			pr_info("copy_from_user 1\n");
+			*/
+			if (copy_from_user(&rs485conf, (void __user *) arg,
+						sizeof(rs485conf)))
+				return -EFAULT;
+
+			/*
+			pr_info("serial8250_config_rs485 2\n");
+			serial8250_config_rs485(port, &rs485conf);
+			*/
+
+
+			mcr = serial_in(up, UART_MCR);
+			mcr &= ~UART_MCR_RTS;
+			serial_out(up, UART_MCR, mcr );
+
+
+			/*
+			if( !up->rts_gpio_hdlr ) {
+				up->rts_gpio_hdlr = gpio_request_ex("uart_para2", "uart_rts" );
+				pr_info("gpio_request_ex pin [%d] [%s]\n", up->rts_gpio_hdlr, "uart_rts" );
+				res = gpio_set_one_pin_io_status( up->rts_gpio_hdlr, 1, "uart_rts" );
+				pr_info("gpio_set_one_pin_io_status pin [%d] [%s] \n", res, "uart_rts" );
+				if( !res ) {
+					res = gpio_write_one_pin_value( up->rts_gpio_hdlr,  1,  "uart_rts" );
+					pr_info("gpio_write_one_pin_value pin [%d] [%s]\n", res, "uart_rts" );
+				}
+			}
+
+			if( !up->cts_gpio_hdlr ) {
+
+				up->cts_gpio_hdlr = gpio_request_ex("uart_para2", "uart_cts" );
+				pr_info("gpio_write_one_pin_value pin [%d] [%s]\n", up->cts_gpio_hdlr, "uart_cts" );
+
+				res = gpio_set_one_pin_io_status( up->cts_gpio_hdlr, 1, "uart_cts" );
+				pr_info("gpio_set_one_pin_io_status pin [%d] [%s]\n", res, "uart_cts" );
+
+				if( !res ) {
+					res = gpio_write_one_pin_value( up->cts_gpio_hdlr,
+								       1,  "uart_cts" );
+					pr_info("gpio_write_one_pin_value pin [%d] [%s]\n", res, "uart_cts" );
+				}
+			}
+			*/
+
+//			pr_info("gpio_request %d\n", res);
+//			res = gpio_direction_output( pinHandler, 1);
+//			pr_info("gpio_request %d\n", res);
+			/*
+			res = gpio_request( "PI17", "rs485" );
+			pr_info("gpio_request %d\n", res);
+			res = gpio_direction_output( pinHandler, 1);
+			pr_info("gpio_request %d\n", res);
+			 */
+
+			break;
+
+		case TIOCGRS485:
+			/*
+			pr_info("gpio_is_valid 2\n");
+			if (!gpio_is_valid(up->rts_gpio))
+				return -ENODEV;
+			pr_info("copy_from_user 2\n");
+			if (copy_to_user((void __user *) arg, &up->rs485,
+						sizeof(rs485conf)))
+				return -EFAULT;
+			*/
+			break;
+
+		default:
+			return -ENOIOCTLCMD;
+	}
+	return 0;
+}
+
 
 static void
 serial8250_set_termios(struct uart_port *port, struct ktermios *termios,
@@ -2714,6 +2969,7 @@ static struct uart_ops serial8250_pops = {
 	.request_port	= serial8250_request_port,
 	.config_port	= serial8250_config_port,
 	.verify_port	= serial8250_verify_port,
+	.ioctl		= serial8250_ioctl,
 #ifdef CONFIG_CONSOLE_POLL
 	.poll_get_char = serial8250_get_poll_char,
 	.poll_put_char = serial8250_put_poll_char,
@@ -3230,6 +3486,9 @@ int serial8250_register_port(struct uart_port *port)
 		uart->port.flags        = port->flags | UPF_BOOT_AUTOCONF;
 		uart->port.mapbase      = port->mapbase;
 		uart->port.private_data = port->private_data;
+
+
+
 		if (port->dev)
 			uart->port.dev = port->dev;
 
@@ -3253,6 +3512,8 @@ int serial8250_register_port(struct uart_port *port)
 		if (serial8250_isa_config != NULL)
 			serial8250_isa_config(0, &uart->port,
 					&uart->capabilities);
+
+
 
 		ret = uart_add_one_port(&serial8250_reg, &uart->port);
 		if (ret == 0)
