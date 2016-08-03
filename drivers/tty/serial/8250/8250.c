@@ -275,8 +275,7 @@ static const struct serial8250_config uart_config[] = {
 		.name		= "U6_16550A",
 		.fifo_size	= 64,
 		.tx_loadsz	= 32,
-		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_11
-		              | UART_FCR_T_TRIG_10,
+		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_11 | UART_FCR_T_TRIG_00,
 		.flags		= UART_CAP_FIFO | UART_CAP_AFE,
 	},
 	[PORT_TEGRA] = {
@@ -1388,9 +1387,6 @@ static void serial8250_start_tx(struct uart_port *port)
 		container_of(port, struct uart_8250_port, port);
 
 	if (!(up->ier & UART_IER_THRI)) {
-
-
-
 		if (up->rs485.flags & SER_RS485_ENABLED) {
 			int ret;
 			ret = (up->rs485.flags & SER_RS485_RTS_ON_SEND) ? 1 : 0;
@@ -1593,8 +1589,8 @@ void serial8250_tx_chars(struct uart_8250_port *up)
 
 	DEBUG_INTR("THRE...");
 
-	if (uart_circ_empty(xmit))
-		__stop_tx(up);
+	//if (uart_circ_empty(xmit))
+	//	__stop_tx(up);
 }
 EXPORT_SYMBOL_GPL(serial8250_tx_chars);
 
